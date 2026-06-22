@@ -1,0 +1,713 @@
+import React, { useEffect, useState, useMemo } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import {
+  Plus, Users, Mail, BarChart2, Trash2, Edit2, Clock,
+  Search, AlertTriangle, CheckCircle2, XCircle, Minus,
+  ChevronDown, ArrowUpDown, Shield, Zap, Target, Filter
+} from 'lucide-react';
+import { supabase } from '../lib/supabase.js';
+
+/* ─── constants ─────────────────────────────────────────────── */
+
+const AVATAR_PALETTES = [
+  { bg: '#dbeafe', fg: '#1d4ed8' }, { bg: '#dcfce7', fg: '#15803d' },
+  { bg: '#fce7f3', fg: '#be185d' }, { bg: '#ede9fe', fg: '#7c3aed' },
+  { bg: '#ccfbf1', fg: '#0f766e' }, { bg: '#fef3c7', fg: '#b45309' },
+  { bg: '#fee2e2', fg: '#b91c1c' }, { bg: '#e0f2fe', fg: '#0369a1' },
+];
+
+const VERDICT_META = {
+  'strong hire': { label: 'Strong Hire', short: 'S.Hire', cls: 'verdict-strong-hire', dot: '#16a34a', bar: '#22c55e' },
+  'hire':        { label: 'Hire',        short: 'Hire',   cls: 'verdict-hire',        dot: '#059669', bar: '#10b981' },
+  'consider':    { label: 'Consider',    short: 'Consider', cls: 'verdict-consider', dot: '#d97706', bar: '#f59e0b' },
+  'reject':      { label: 'Reject',      short: 'Reject', cls: 'verdict-reject',      dot: '#dc2626', bar: '#ef4444' },
+};
+
+const SORT_OPTIONS = [
+  { value: 'newest',     label: 'Newest first' },
+  { value: 'oldest',     label: 'Oldest first' },
+  { value: 'name_asc',   label: 'Name A → Z'   },
+  { value: 'confidence', label: 'Confidence ↓'  },
+  { value: 'coverage',   label: 'Coverage ↓'    },
+];
+
+/* ─── helpers ────────────────────────────────────────────────── */
+
+function palette(name) {
+  return AVATAR_PALETTES[name.charCodeAt(0) % AVATAR_PALETTES.length];
+}
+
+function normalizeVerdict(v) {
+  return (v || '').toString().toLowerCase().replace(/[-_]/g, ' ').trim();
+}
+
+function verdictMeta(rec) {
+  if (!rec) return null;
+  const v = normalizeVerdict(rec.verdict || rec);
+  return VERDICT_META[v] || null;
+}
+
+function coverage(matrix) {
+  if (!matrix) return null;
+  const m = (matrix.matched || []).length;
+  const p = (matrix.partial  || []).length;
+  const x = (matrix.missing  || []).length;
+  const total = m + p + x;
+  const pct = total > 0 ? Math.round(((m + p * 0.5) / total) * 100) : 0;
+  return { matched: m, partial: p, missing: x, total, pct };
+}
+
+function fmtDate(d) {
+  const date = new Date(d);
+  const now  = new Date();
+  const diff = (now - date) / 1000;
+  if (diff < 60)      return 'just now';
+  if (diff < 3600)    return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400)   return `${Math.floor(diff / 3600)}h ago`;
+  if (diff < 604800)  return `${Math.floor(diff / 86400)}d ago`;
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function topSkills(parsedResume, max = 5) {
+  const skills = parsedResume?.skills;
+  if (!Array.isArray(skills) || skills.length === 0) return [];
+  return skills.slice(0, max).map(s => String(s));
+}
+
+function jobTitle(parsedJd) {
+  return parsedJd?.title || null;
+}
+
+/* ─── CircleScore ────────────────────────────────────────────── */
+
+function CircleScore({ value, size = 52 }) {
+  if (value == null) return null;
+  const r = (size - 6) / 2;
+  const circ = 2 * Math.PI * r;
+  const filled = (value / 100) * circ;
+  const color = value >= 70 ? '#22c55e' : value >= 45 ? '#f59e0b' : '#ef4444';
+
+  return (
+    <div style={{ position: 'relative', width: size, height: size, flexShrink: 0 }}>
+      <svg width={size} height={size} style={{ transform: 'rotate(-90deg)' }}>
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="var(--slate-100)" strokeWidth={5} />
+        <circle
+          cx={size/2} cy={size/2} r={r}
+          fill="none" stroke={color} strokeWidth={5}
+          strokeDasharray={`${filled} ${circ}`}
+          strokeLinecap="round"
+        />
+      </svg>
+      <span style={{
+        position: 'absolute', inset: 0,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        fontSize: 11, fontWeight: 800, color,
+      }}>{value}%</span>
+    </div>
+  );
+}
+
+/* ─── VerdictBar ─────────────────────────────────────────────── */
+
+function VerdictBar({ counts }) {
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  if (total === 0) return null;
+
+  const segments = [
+    { key: 'strong hire', color: '#22c55e' },
+    { key: 'hire',        color: '#10b981' },
+    { key: 'consider',    color: '#f59e0b' },
+    { key: 'reject',      color: '#ef4444' },
+  ].filter(s => counts[s.key] > 0);
+
+  return (
+    <div style={{ display: 'flex', height: 6, borderRadius: 99, overflow: 'hidden', gap: 1, width: '100%' }}>
+      {segments.map(s => (
+        <div
+          key={s.key}
+          style={{ background: s.color, width: `${(counts[s.key] / total) * 100}%`, borderRadius: 99 }}
+          title={`${VERDICT_META[s.key]?.label}: ${counts[s.key]}`}
+        />
+      ))}
+    </div>
+  );
+}
+
+/* ─── CandidateCard ──────────────────────────────────────────── */
+
+function CandidateCard({ candidate, analysis, onDelete, onNavigate, deleting }) {
+  const pal    = palette(candidate.name);
+  const rec    = analysis?.recommendation;
+  const vm     = verdictMeta(rec);
+  const cov    = coverage(analysis?.coverage_matrix);
+  const skills = topSkills(analysis?.parsed_resume);
+  const title  = jobTitle(analysis?.parsed_jd);
+  const conf   = analysis?.confidence_score ?? null;
+  const risks  = analysis?.risk_analysis?.items || [];
+  const highRisks = risks.filter(r => r.severity === 'high').length;
+  const allRisks  = risks.length;
+
+  const isReady      = analysis?.status === 'completed';
+  const isProcessing = analysis?.status === 'processing';
+  const isFailed     = analysis?.status === 'failed';
+
+  return (
+    <div style={{
+      background: '#fff',
+      border: '1px solid var(--slate-200)',
+      borderRadius: 'var(--r-xl)',
+      boxShadow: 'var(--shadow-sm)',
+      overflow: 'hidden',
+      transition: 'border-color 0.15s, box-shadow 0.15s',
+    }}
+    onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--slate-300)'; e.currentTarget.style.boxShadow = 'var(--shadow-md)'; }}
+    onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--slate-200)'; e.currentTarget.style.boxShadow = 'var(--shadow-sm)'; }}
+    >
+      {/* ── Top accent line for verdict ── */}
+      {vm && (
+        <div style={{ height: 3, background: vm.bar, width: '100%' }} />
+      )}
+
+      <div style={{ padding: 'var(--s5) var(--s6)' }}>
+        {/* ── Row 1: Avatar + Info + Confidence ── */}
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 'var(--s4)', marginBottom: 'var(--s4)' }}>
+          {/* Avatar */}
+          <div style={{
+            width: 48, height: 48, borderRadius: 'var(--r-xl)',
+            background: pal.bg, color: pal.fg,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontWeight: 800, fontSize: 18, flexShrink: 0,
+            letterSpacing: '-0.02em',
+          }}>
+            {candidate.name.charAt(0).toUpperCase()}
+          </div>
+
+          {/* Name block */}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--s2)', flexWrap: 'wrap' }}>
+              <span style={{ fontWeight: 700, fontSize: 15, color: 'var(--slate-900)', letterSpacing: '-0.01em' }}>
+                {candidate.name}
+              </span>
+              {vm && (
+                <span className={`badge ${vm.cls}`} style={{ fontSize: 10 }}>{vm.label}</span>
+              )}
+              {isProcessing && (
+                <span className="badge badge-blue" style={{ fontSize: 10, display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <div className="spin" style={{ width: 8, height: 8, borderWidth: 1.5 }}></div>
+                  Analyzing
+                </span>
+              )}
+              {isFailed && <span className="badge badge-red" style={{ fontSize: 10 }}>Failed</span>}
+              {!analysis && <span className="badge badge-slate" style={{ fontSize: 10 }}>Not analyzed</span>}
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--s3)', marginTop: 3, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 12, color: 'var(--slate-500)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                <Mail size={11} />{candidate.email}
+              </span>
+              {title && (
+                <>
+                  <span style={{ color: 'var(--slate-300)', fontSize: 11 }}>·</span>
+                  <span style={{ fontSize: 12, color: 'var(--slate-600)', fontWeight: 500 }}>
+                    {title}
+                  </span>
+                </>
+              )}
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 3, marginTop: 3 }}>
+              <Clock size={10} color="var(--slate-400)" />
+              <span style={{ fontSize: 11, color: 'var(--slate-400)' }}>Added {fmtDate(candidate.created_at)}</span>
+            </div>
+          </div>
+
+          {/* Confidence ring */}
+          {isReady && conf !== null && <CircleScore value={conf} />}
+        </div>
+
+        {/* ── Row 2: Coverage bar (only if analyzed) ── */}
+        {isReady && cov && (
+          <div style={{ marginBottom: 'var(--s4)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+              <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--slate-500)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                Requirement Coverage
+              </span>
+              <span style={{
+                fontSize: 12, fontWeight: 800,
+                color: cov.pct >= 70 ? 'var(--green-600)' : cov.pct >= 45 ? 'var(--amber-600)' : 'var(--red-600)',
+              }}>{cov.pct}%</span>
+            </div>
+
+            {/* Segmented bar */}
+            <div style={{ display: 'flex', height: 7, borderRadius: 99, overflow: 'hidden', background: 'var(--slate-100)', gap: 1 }}>
+              {cov.matched > 0 && (
+                <div style={{ width: `${(cov.matched / cov.total) * 100}%`, background: '#22c55e', borderRadius: 99 }} title={`Matched: ${cov.matched}`} />
+              )}
+              {cov.partial > 0 && (
+                <div style={{ width: `${(cov.partial / cov.total) * 100}%`, background: '#f59e0b', borderRadius: 99 }} title={`Partial: ${cov.partial}`} />
+              )}
+              {cov.missing > 0 && (
+                <div style={{ width: `${(cov.missing / cov.total) * 100}%`, background: '#e2e8f0', borderRadius: 99 }} title={`Missing: ${cov.missing}`} />
+              )}
+            </div>
+
+            {/* Coverage breakdown chips */}
+            <div style={{ display: 'flex', gap: 'var(--s3)', marginTop: 8 }}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--green-700)', fontWeight: 600 }}>
+                <CheckCircle2 size={11} />{cov.matched} matched
+              </span>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--amber-600)', fontWeight: 600 }}>
+                <Minus size={11} />{cov.partial} partial
+              </span>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--slate-400)', fontWeight: 600 }}>
+                <XCircle size={11} />{cov.missing} missing
+              </span>
+              {allRisks > 0 && (
+                <span style={{
+                  display: 'flex', alignItems: 'center', gap: 4,
+                  fontSize: 11, fontWeight: 600,
+                  color: highRisks > 0 ? 'var(--red-600)' : 'var(--amber-600)',
+                  marginLeft: 'auto',
+                }}>
+                  <AlertTriangle size={11} />
+                  {allRisks} risk{allRisks !== 1 ? 's' : ''}
+                  {highRisks > 0 && <span style={{ color: 'var(--red-600)' }}>({highRisks} high)</span>}
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ── Divider ── */}
+        <div style={{ borderTop: '1px solid var(--slate-100)', margin: '0 0 var(--s4)' }} />
+
+        {/* ── Row 3: Skills + Actions ── */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 'var(--s3)' }}>
+          {/* Skills chips */}
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', flex: 1, minWidth: 0 }}>
+            {skills.length > 0
+              ? (
+                <>
+                  {skills.map((s, i) => (
+                    <span key={i} style={{
+                      padding: '2px 9px',
+                      background: 'var(--slate-100)',
+                      border: '1px solid var(--slate-200)',
+                      borderRadius: 20,
+                      fontSize: 11,
+                      fontWeight: 500,
+                      color: 'var(--slate-600)',
+                    }}>{s}</span>
+                  ))}
+                  {(analysis?.parsed_resume?.skills?.length ?? 0) > 5 && (
+                    <span style={{ padding: '2px 9px', background: 'var(--blue-50)', border: '1px solid var(--blue-100)', borderRadius: 20, fontSize: 11, fontWeight: 600, color: 'var(--blue-600)' }}>
+                      +{analysis.parsed_resume.skills.length - 5}
+                    </span>
+                  )}
+                </>
+              )
+              : !isReady && (
+                <span style={{ fontSize: 12, color: 'var(--slate-300)', fontStyle: 'italic' }}>
+                  Run analysis to extract skills
+                </span>
+              )
+            }
+          </div>
+
+          {/* Actions */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--s2)', flexShrink: 0 }}>
+            {isReady ? (
+              <button className="btn btn-primary btn-sm" onClick={() => onNavigate(`/candidates/${candidate.id}/analysis`)}>
+                <BarChart2 size={12} /> Report
+              </button>
+            ) : (
+              <button className="btn btn-secondary btn-sm" onClick={() => onNavigate(`/candidates/${candidate.id}/analysis`)}>
+                <Zap size={12} /> {isProcessing ? 'View Progress' : 'Analyze'}
+              </button>
+            )}
+            <button className="btn btn-secondary btn-icon btn-sm" onClick={() => onNavigate(`/candidates/${candidate.id}/edit`)} title="Edit">
+              <Edit2 size={13} />
+            </button>
+            <button className="btn btn-danger btn-icon btn-sm" onClick={() => onDelete(candidate.id)} disabled={deleting === candidate.id} title="Delete">
+              <Trash2 size={13} />
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─── Main Page ──────────────────────────────────────────────── */
+
+export default function CandidatesPage() {
+  const [candidates, setCandidates] = useState([]);
+  const [analyses,   setAnalyses]   = useState({});
+  const [loading,    setLoading]    = useState(true);
+  const [deleting,   setDeleting]   = useState(null);
+  const [search,     setSearch]     = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [verdictFilter, setVerdictFilter] = useState('all');
+  const [sort,       setSort]       = useState('newest');
+  const [showSort,   setShowSort]   = useState(false);
+  const navigate = useNavigate();
+
+  useEffect(() => { load(); }, []);
+
+  async function load() {
+    setLoading(true);
+    const { data } = await supabase
+      .from('candidates').select('*').order('created_at', { ascending: false });
+    if (data?.length) {
+      setCandidates(data);
+      const { data: ad } = await supabase
+        .from('analyses')
+        .select('*')
+        .in('candidate_id', data.map(c => c.id))
+        .order('created_at', { ascending: false });
+      const map = {};
+      (ad || []).forEach(a => { if (!map[a.candidate_id]) map[a.candidate_id] = a; });
+      setAnalyses(map);
+    } else {
+      setCandidates([]);
+    }
+    setLoading(false);
+  }
+
+  async function remove(id) {
+    if (!confirm('Delete this candidate and all associated analysis data?')) return;
+    setDeleting(id);
+    await supabase.from('candidates').delete().eq('id', id);
+    setCandidates(p => p.filter(c => c.id !== id));
+    setDeleting(null);
+  }
+
+  /* ── Derived stats ── */
+  const stats = useMemo(() => {
+    const verdictCounts = { 'strong hire': 0, hire: 0, consider: 0, reject: 0 };
+    let analyzed = 0, processing = 0;
+
+    candidates.forEach(c => {
+      const a = analyses[c.id];
+      if (a?.status === 'completed') {
+        analyzed++;
+        const v = normalizeVerdict(a.recommendation?.verdict);
+        if (v in verdictCounts) verdictCounts[v]++;
+      }
+      if (a?.status === 'processing') processing++;
+    });
+
+    const avgConf = (() => {
+      const scores = candidates
+        .map(c => analyses[c.id]?.confidence_score)
+        .filter(s => s != null);
+      return scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+    })();
+
+    return { total: candidates.length, analyzed, processing, verdictCounts, avgConf };
+  }, [candidates, analyses]);
+
+  /* ── Filtered + sorted list ── */
+  const filtered = useMemo(() => {
+    let list = [...candidates];
+
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter(c => c.name.toLowerCase().includes(q) || c.email.toLowerCase().includes(q));
+    }
+
+    if (statusFilter !== 'all') {
+      list = list.filter(c => {
+        const a = analyses[c.id];
+        if (statusFilter === 'analyzed')   return a?.status === 'completed';
+        if (statusFilter === 'processing') return a?.status === 'processing';
+        if (statusFilter === 'unanalyzed') return !a || a.status === 'pending';
+        return true;
+      });
+    }
+
+    if (verdictFilter !== 'all') {
+      list = list.filter(c => {
+        const a = analyses[c.id];
+        if (!a?.recommendation) return false;
+        return normalizeVerdict(a.recommendation.verdict) === verdictFilter;
+      });
+    }
+
+    list.sort((a, b) => {
+      const aa = analyses[a.id], ab = analyses[b.id];
+      if (sort === 'newest')     return new Date(b.created_at) - new Date(a.created_at);
+      if (sort === 'oldest')     return new Date(a.created_at) - new Date(b.created_at);
+      if (sort === 'name_asc')   return a.name.localeCompare(b.name);
+      if (sort === 'confidence') return (ab?.confidence_score ?? -1) - (aa?.confidence_score ?? -1);
+      if (sort === 'coverage') {
+        const ca = coverage(aa?.coverage_matrix)?.pct ?? -1;
+        const cb = coverage(ab?.coverage_matrix)?.pct ?? -1;
+        return cb - ca;
+      }
+      return 0;
+    });
+
+    return list;
+  }, [candidates, analyses, search, statusFilter, verdictFilter, sort]);
+
+  const STATUS_FILTERS = [
+    { value: 'all',        label: 'All',        count: candidates.length },
+    { value: 'analyzed',   label: 'Analyzed',   count: stats.analyzed },
+    { value: 'processing', label: 'In Progress', count: stats.processing },
+    { value: 'unanalyzed', label: 'Unanalyzed',  count: candidates.length - stats.analyzed - stats.processing },
+  ];
+
+  const VERDICT_FILTERS = [
+    { value: 'all',         label: 'All verdicts' },
+    { value: 'strong hire', label: 'Strong Hire' },
+    { value: 'hire',        label: 'Hire' },
+    { value: 'consider',    label: 'Consider' },
+    { value: 'reject',      label: 'Reject' },
+  ];
+
+  return (
+    <div>
+      {/* ── Page Header ── */}
+      <div className="page-header">
+        <div className="page-header-left">
+          <h2>Candidates</h2>
+          <p>Review and analyze candidate resumes against job descriptions</p>
+        </div>
+        <Link to="/candidates/new" className="btn btn-primary">
+          <Plus size={14} /> Add Candidate
+        </Link>
+      </div>
+
+      <div className="page-body">
+
+        {/* ── Overview Panel ── */}
+        {candidates.length > 0 && (
+          <div style={{
+            background: '#fff',
+            border: '1px solid var(--slate-200)',
+            borderRadius: 'var(--r-xl)',
+            padding: 'var(--s5) var(--s6)',
+            marginBottom: 'var(--s6)',
+            boxShadow: 'var(--shadow-sm)',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--s6)', flexWrap: 'wrap' }}>
+
+              {/* Stats */}
+              <div style={{ display: 'flex', gap: 'var(--s6)', flexWrap: 'wrap' }}>
+                {[
+                  { label: 'Total Candidates', value: stats.total,     color: 'var(--slate-800)' },
+                  { label: 'Analyzed',          value: stats.analyzed,  color: 'var(--green-600)' },
+                  { label: 'In Progress',       value: stats.processing, color: 'var(--amber-600)' },
+                  { label: 'Avg. Confidence',   value: stats.avgConf != null ? `${stats.avgConf}%` : '—', color: 'var(--blue-600)' },
+                ].map(s => (
+                  <div key={s.label} style={{ minWidth: 60 }}>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: s.color, letterSpacing: '-0.04em', lineHeight: 1 }}>
+                      {s.value}
+                    </div>
+                    <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--slate-400)', textTransform: 'uppercase', letterSpacing: '0.06em', marginTop: 3 }}>
+                      {s.label}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Divider */}
+              {stats.analyzed > 0 && (
+                <div style={{ width: 1, height: 48, background: 'var(--slate-100)', flexShrink: 0 }} />
+              )}
+
+              {/* Verdict distribution */}
+              {stats.analyzed > 0 && (
+                <div style={{ flex: 1, minWidth: 220 }}>
+                  <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--slate-400)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>
+                    Verdict Distribution
+                  </div>
+                  <VerdictBar counts={stats.verdictCounts} />
+                  <div style={{ display: 'flex', gap: 'var(--s4)', marginTop: 8, flexWrap: 'wrap' }}>
+                    {Object.entries(stats.verdictCounts)
+                      .filter(([, n]) => n > 0)
+                      .map(([k, n]) => (
+                        <span key={k} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--slate-600)', fontWeight: 500 }}>
+                          <span style={{ width: 8, height: 8, borderRadius: 2, background: VERDICT_META[k]?.bar, display: 'block' }} />
+                          {VERDICT_META[k]?.label}: <strong>{n}</strong>
+                        </span>
+                      ))
+                    }
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ── Filter & Sort Bar ── */}
+        {candidates.length > 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--s3)', marginBottom: 'var(--s5)', flexWrap: 'wrap' }}>
+
+            {/* Search */}
+            <div style={{ position: 'relative', width: 240 }}>
+              <Search size={13} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--slate-400)', pointerEvents: 'none' }} />
+              <input
+                className="input"
+                style={{ paddingLeft: 32, height: 34, fontSize: 12 }}
+                placeholder="Search by name or email…"
+                value={search}
+                onChange={e => setSearch(e.target.value)}
+              />
+            </div>
+
+            {/* Status filter pills */}
+            <div style={{ display: 'flex', background: 'var(--slate-100)', borderRadius: 'var(--r-lg)', padding: 3, gap: 2 }}>
+              {STATUS_FILTERS.map(f => (
+                <button
+                  key={f.value}
+                  onClick={() => setStatusFilter(f.value)}
+                  style={{
+                    padding: '4px 10px',
+                    borderRadius: 'var(--r-md)',
+                    border: 'none',
+                    cursor: 'pointer',
+                    fontSize: 12,
+                    fontWeight: 600,
+                    fontFamily: 'inherit',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 5,
+                    transition: 'all 0.12s',
+                    background: statusFilter === f.value ? '#fff' : 'transparent',
+                    color: statusFilter === f.value ? 'var(--slate-800)' : 'var(--slate-500)',
+                    boxShadow: statusFilter === f.value ? 'var(--shadow-xs)' : 'none',
+                  }}
+                >
+                  {f.label}
+                  <span style={{
+                    fontSize: 10, fontWeight: 700,
+                    background: statusFilter === f.value ? 'var(--blue-100)' : 'var(--slate-200)',
+                    color: statusFilter === f.value ? 'var(--blue-700)' : 'var(--slate-500)',
+                    padding: '0 5px', borderRadius: 20,
+                  }}>{f.count}</span>
+                </button>
+              ))}
+            </div>
+
+            {/* Verdict filter */}
+            <select
+              value={verdictFilter}
+              onChange={e => setVerdictFilter(e.target.value)}
+              style={{
+                padding: '5px 10px', borderRadius: 'var(--r-md)',
+                border: '1px solid var(--slate-200)', background: '#fff',
+                fontSize: 12, fontWeight: 500, fontFamily: 'inherit',
+                color: 'var(--slate-700)', cursor: 'pointer', height: 34,
+              }}
+            >
+              {VERDICT_FILTERS.map(f => (
+                <option key={f.value} value={f.value}>{f.label}</option>
+              ))}
+            </select>
+
+            {/* Sort */}
+            <div style={{ position: 'relative', marginLeft: 'auto' }}>
+              <button
+                className="btn btn-secondary btn-sm"
+                style={{ height: 34, gap: 6 }}
+                onClick={() => setShowSort(p => !p)}
+              >
+                <ArrowUpDown size={12} />
+                {SORT_OPTIONS.find(o => o.value === sort)?.label}
+                <ChevronDown size={11} />
+              </button>
+              {showSort && (
+                <>
+                  <div style={{ position: 'fixed', inset: 0, zIndex: 40 }} onClick={() => setShowSort(false)} />
+                  <div style={{
+                    position: 'absolute', right: 0, top: '100%', marginTop: 4,
+                    background: '#fff', border: '1px solid var(--slate-200)',
+                    borderRadius: 'var(--r-lg)', boxShadow: 'var(--shadow-lg)',
+                    zIndex: 50, minWidth: 170, padding: 4, overflow: 'hidden',
+                  }}>
+                    {SORT_OPTIONS.map(o => (
+                      <button
+                        key={o.value}
+                        onClick={() => { setSort(o.value); setShowSort(false); }}
+                        style={{
+                          display: 'block', width: '100%', textAlign: 'left',
+                          padding: '7px 12px', border: 'none', background: sort === o.value ? 'var(--blue-50)' : 'transparent',
+                          color: sort === o.value ? 'var(--blue-700)' : 'var(--slate-700)',
+                          fontSize: 12, fontWeight: sort === o.value ? 600 : 400,
+                          fontFamily: 'inherit', cursor: 'pointer', borderRadius: 'var(--r-md)',
+                        }}
+                      >
+                        {o.label}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* Result count */}
+            <span style={{ fontSize: 12, color: 'var(--slate-400)' }}>
+              {filtered.length} of {candidates.length}
+            </span>
+          </div>
+        )}
+
+        {/* ── Candidate List ── */}
+        {loading ? (
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: 'var(--s16)', gap: 'var(--s4)' }}>
+            <div className="spin spin-slate" style={{ width: 24, height: 24, borderWidth: 3 }}></div>
+            <span style={{ fontSize: 13, color: 'var(--slate-400)' }}>Loading candidates…</span>
+          </div>
+        ) : candidates.length === 0 ? (
+          <div style={{
+            background: '#fff', border: '1px solid var(--slate-200)',
+            borderRadius: 'var(--r-xl)', padding: 'var(--s16) var(--s8)',
+            textAlign: 'center', boxShadow: 'var(--shadow-sm)',
+          }}>
+            <div style={{
+              width: 64, height: 64, background: 'var(--slate-100)',
+              borderRadius: 'var(--r-xl)', margin: '0 auto var(--s4)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}>
+              <Users size={28} color="var(--slate-300)" />
+            </div>
+            <h3 style={{ fontSize: 16, fontWeight: 700, color: 'var(--slate-700)', marginBottom: 8 }}>No candidates yet</h3>
+            <p style={{ fontSize: 13, color: 'var(--slate-400)', lineHeight: 1.7, maxWidth: 360, margin: '0 auto var(--s6)' }}>
+              Add your first candidate with a resume and job description to start the AI-powered intelligence audit.
+            </p>
+            <Link to="/candidates/new" className="btn btn-primary">
+              <Plus size={14} /> Add First Candidate
+            </Link>
+          </div>
+        ) : filtered.length === 0 ? (
+          <div style={{
+            background: '#fff', border: '1px solid var(--slate-200)',
+            borderRadius: 'var(--r-xl)', padding: 'var(--s12) var(--s8)',
+            textAlign: 'center',
+          }}>
+            <Search size={28} color="var(--slate-300)" style={{ marginBottom: 12 }} />
+            <h3 style={{ fontSize: 15, fontWeight: 600, color: 'var(--slate-600)', marginBottom: 6 }}>No matches</h3>
+            <p style={{ fontSize: 13, color: 'var(--slate-400)' }}>Try adjusting your search or filters.</p>
+            <button className="btn btn-secondary btn-sm" style={{ marginTop: 16 }}
+              onClick={() => { setSearch(''); setStatusFilter('all'); setVerdictFilter('all'); }}>
+              Clear filters
+            </button>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--s3)' }}>
+            {filtered.map(c => (
+              <CandidateCard
+                key={c.id}
+                candidate={c}
+                analysis={analyses[c.id]}
+                onDelete={remove}
+                onNavigate={navigate}
+                deleting={deleting}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
