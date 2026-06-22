@@ -1,25 +1,14 @@
 {
-  "name": "resume-intelligence-auditor",
-  "private": true,
+  "name": "assesment-root",
   "version": "1.0.0",
-  "type": "module",
+  "private": true,
   "scripts": {
-    "dev": "vite --host",
-    "build": "vite build",
-    "preview": "vite preview",
-    "simulate-workflow": "node scripts/simulate-workflow.js"
-  },
-  "dependencies": {
-    "@supabase/supabase-js": "^2.49.4",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-router-dom": "^6.28.0",
-    "lucide-react": "^0.462.0"
+    "dev": "npm --prefix backend run db:up && concurrently \"npm --prefix backend run dev\" \"npm --prefix frontend run dev\"",
+    "start:backend": "npm --prefix backend run start",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:frontend": "npm --prefix frontend run dev"
   },
   "devDependencies": {
-    "@types/react": "^18.3.12",
-    "@types/react-dom": "^18.3.1",
-    "@vitejs/plugin-react": "^4.3.3",
-    "vite": "^5.4.10"
+    "concurrently": "^8.2.0"
   }
 }
